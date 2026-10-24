@@ -516,14 +516,8 @@ impl Surface {
             #[cfg(not(target_os = "windows"))]
             let child_terminator = pty.child.terminator();
 
-            let machine = Machine::new(
-                Arc::clone(&terminal),
-                pty,
-                listener,
-                WindowId::from(id as u64),
-                id,
-            )
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
+            let machine = Machine::new(Arc::clone(&terminal), pty, listener, id)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
             let channel = machine.channel();
             *pty_writer.lock().unwrap() = Some(channel.clone());
             let io_thread = machine.spawn();

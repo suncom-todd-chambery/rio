@@ -365,13 +365,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             }
         }
 
-        let machine = Machine::new(
-            Arc::clone(&terminal),
-            pty,
-            event_proxy.clone(),
-            window_id,
-            route_id,
-        )?;
+        let machine =
+            Machine::new(Arc::clone(&terminal), pty, event_proxy.clone(), route_id)?;
         let channel = machine.channel();
         let io_thread = if config.spawn_performer {
             Some(machine.spawn())
@@ -417,15 +412,29 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         size: ContextDimension,
         scaled_margin: Margin,
         sugarloaf_errors: Option<SugarloafErrors>,
+        placeholder: bool,
     ) -> Result<Self, Box<dyn Error>> {
-        let initial_context = match ContextManager::create_context(
-            cursor_state,
-            event_proxy.clone(),
-            window_id,
-            rich_text_id,
-            size,
-            &ctx_config,
-        ) {
+        // A window opened for a torn-off tab adopts that tab right
+        // after creation, so its initial context must not spawn a shell.
+        let initial_context = if placeholder {
+            Ok(create_dead_context(
+                event_proxy.clone(),
+                window_id,
+                ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
+                rich_text_id,
+                size,
+            ))
+        } else {
+            ContextManager::create_context(
+                cursor_state,
+                event_proxy.clone(),
+                window_id,
+                rich_text_id,
+                size,
+                &ctx_config,
+            )
+        };
+        let initial_context = match initial_context {
             Ok(context) => context,
             Err(err_message) => {
                 tracing::error!("{:?}", err_message);
@@ -1112,6 +1121,53 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
 
         self.keep_only_active_context_visible(sugarloaf);
+    }
+
+    /// Detach the focused tab (every split in it) so another window can
+    /// adopt it. Its PTYs keep running. `None` when it is the only tab:
+    /// tearing that off would just move the window.
+    pub fn take_current_tab(
+        &mut self,
+        sugarloaf: &mut Sugarloaf,
+    ) -> Option<ContextGrid<T>> {
+        if self.contexts.len() < 2 {
+            return None;
+        }
+
+        let removed = self.current_index;
+        self.contexts[removed].remove_from_sugarloaf(sugarloaf);
+        let grid = self.contexts.remove(removed);
+        self.current_index = current_index_after_tab_removal(removed, removed);
+        self.sync_current_route();
+        self.keep_only_active_context_visible(sugarloaf);
+        Some(grid)
+    }
+
+    /// Replace every tab with `grid`, a tab detached from another
+    /// window. The terminals are retargeted so their events reach this
+    /// window from now on.
+    pub fn adopt_tab(&mut self, mut grid: ContextGrid<T>, sugarloaf: &mut Sugarloaf) {
+        for item in grid.contexts_mut().values_mut() {
+            {
+                let mut terminal = item.val.terminal.lock();
+                terminal.window_id = self.window_id;
+                // A damage event sent to the old window before the
+                // retarget was dropped there; without the reset the
+                // PTY thread would wait on it forever.
+                terminal.damage_event_in_flight = false;
+            }
+            item.val
+                .renderable_content
+                .pending_update
+                .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+        }
+
+        for old in self.contexts.iter() {
+            old.remove_from_sugarloaf(sugarloaf);
+        }
+        self.contexts = smallvec![grid];
+        self.current_index = 0;
+        self.sync_current_route();
     }
 
     #[inline]

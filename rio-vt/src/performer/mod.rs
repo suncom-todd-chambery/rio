@@ -12,7 +12,7 @@ use crate::event::sync::FairMutex;
 #[cfg(feature = "pty")]
 use crate::event::RioEvent;
 #[cfg(feature = "pty")]
-use crate::event::{EventListener, Msg, WindowId};
+use crate::event::{EventListener, Msg};
 #[cfg(feature = "pty")]
 use corcovado::channel;
 #[cfg(all(unix, feature = "pty"))]
@@ -126,7 +126,6 @@ pub struct Machine<T: teletypewriter::EventedPty, U: EventListener> {
     poll: corcovado::Poll,
     terminal: Arc<FairMutex<Crosswords<U>>>,
     event_proxy: U,
-    window_id: WindowId,
     route_id: usize,
 }
 
@@ -210,7 +209,6 @@ where
         terminal: Arc<FairMutex<Crosswords<U>>>,
         pty: T,
         event_proxy: U,
-        window_id: WindowId,
         route_id: usize,
     ) -> Result<Machine<T, U>, Box<dyn std::error::Error>> {
         let (sender, receiver) = channel::channel();
@@ -223,7 +221,6 @@ where
             pty,
             terminal,
             event_proxy,
-            window_id,
             route_id,
         })
     }
@@ -306,7 +303,7 @@ where
                     term.damage_event_in_flight = true;
                     self.event_proxy.send_event(
                         RioEvent::TerminalDamaged(self.route_id),
-                        self.window_id,
+                        term.window_id,
                     );
                 }
             }
@@ -437,7 +434,7 @@ where
                     terminal.damage_event_in_flight = true;
                     self.event_proxy.send_event(
                         RioEvent::TerminalDamaged(self.route_id),
-                        self.window_id,
+                        terminal.window_id,
                     );
                 }
 
@@ -548,13 +545,17 @@ where
 
         // Flush exactly once before publishing any exit notification.
         let pending_sync = state.parser.sync_bytes_count() > 0;
-        state.parser.stop_sync(&mut *self.terminal.lock());
+        // Read the window under the same lock: a tab torn off into
+        // another window retargets `Crosswords::window_id`.
+        let window_id = {
+            let mut terminal = self.terminal.lock();
+            state.parser.stop_sync(&mut *terminal);
+            terminal.window_id
+        };
         match &reason {
             Ok(ExitReason::ChildExited(status)) => {
-                self.event_proxy.send_event(
-                    RioEvent::ChildExited(self.route_id, *status),
-                    self.window_id,
-                );
+                self.event_proxy
+                    .send_event(RioEvent::ChildExited(self.route_id, *status), window_id);
                 self.terminal.lock().exit();
             }
             // A reader failure also closes the terminal, since shutdown()
@@ -564,17 +565,14 @@ where
             // Removing the exit() would leave a dead pane open forever.
             Err(err) => {
                 error!("PTY reader failed: {err}");
-                self.event_proxy.send_event(
-                    RioEvent::ChildExited(self.route_id, None),
-                    self.window_id,
-                );
+                self.event_proxy
+                    .send_event(RioEvent::ChildExited(self.route_id, None), window_id);
                 self.terminal.lock().exit();
             }
             Ok(ExitReason::Shutdown) => (),
         }
         if pending_sync || !matches!(reason, Ok(ExitReason::Shutdown)) {
-            self.event_proxy
-                .send_event(RioEvent::Render, self.window_id);
+            self.event_proxy.send_event(RioEvent::Render, window_id);
         }
         if let Err(err) = self.pty.shutdown() {
             error!("PTY shutdown failed: {err}");

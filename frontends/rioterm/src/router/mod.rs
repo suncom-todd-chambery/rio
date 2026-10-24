@@ -1,6 +1,7 @@
 pub mod routes;
 mod window;
 use crate::event::EventProxy;
+use crate::layout::ContextGrid;
 use crate::router::window::{
     configure_window, create_window_builder, DEFAULT_MINIMUM_WINDOW_HEIGHT,
     DEFAULT_MINIMUM_WINDOW_WIDTH,
@@ -31,6 +32,16 @@ use std::time::{Duration, Instant};
 // const RIO_TITLE: &str = "𜱭𜱭";
 // #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const RIO_TITLE: &str = "▲";
+
+/// A tab torn off one window, on its way into a window of its own.
+pub struct DetachedTab {
+    pub grid: ContextGrid<EventProxy>,
+    /// Outer position for the new window, placing the tab under the
+    /// cursor. Ignored where windows cannot position themselves.
+    pub position: PhysicalPosition<i32>,
+    /// Inner size of the window the tab left.
+    pub size: PhysicalSize<u32>,
+}
 
 /// The modal overlays that can own keyboard/IME input, in dispatch
 /// priority order (see [`Route::active_modal`]).
@@ -596,6 +607,7 @@ impl Router<'_> {
             None,
             None,
             false,
+            None,
         );
         let id: WindowId = window.winit_window.id().into();
         let route = Route::new(Assistant::new(), RoutePath::Terminal, window);
@@ -660,6 +672,7 @@ impl Router<'_> {
             open_url,
             app_id,
             false,
+            None,
         );
         let id: WindowId = window.winit_window.id().into();
 
@@ -676,6 +689,39 @@ impl Router<'_> {
         }
 
         self.routes.insert(id, route);
+    }
+
+    /// Open a new window holding `tab`, a tab torn off another window.
+    pub fn create_window_from_tab<'a>(
+        &'a mut self,
+        event_loop: &'a ActiveEventLoop,
+        event_proxy: EventProxy,
+        config: &'a rio_backend::config::Config,
+        tab: DetachedTab,
+        app_id: Option<&str>,
+    ) {
+        let window = RouteWindow::from_target(
+            event_loop,
+            event_proxy,
+            config,
+            &self.font_library,
+            RIO_TITLE,
+            None,
+            None,
+            app_id,
+            false,
+            Some(tab),
+        );
+        let id: WindowId = window.winit_window.id().into();
+        self.routes.insert(
+            id,
+            Route {
+                window,
+                path: RoutePath::Terminal,
+                assistant: Assistant::new(),
+                quit_requested: false,
+            },
+        );
     }
 
     /// Create the quake dropdown window: borderless, always on top,
@@ -697,6 +743,7 @@ impl Router<'_> {
             None,
             None,
             true,
+            None,
         );
         let id: WindowId = window.winit_window.id().into();
         self.routes.insert(
@@ -731,6 +778,7 @@ impl Router<'_> {
             open_url,
             None,
             false,
+            None,
         );
         self.routes.insert(
             window.winit_window.id().into(),
@@ -858,10 +906,23 @@ impl<'a> RouteWindow<'a> {
         open_url: Option<String>,
         app_id: Option<&str>,
         quake: bool,
+        detached_tab: Option<DetachedTab>,
     ) -> RouteWindow<'a> {
         #[allow(unused_mut)]
         let mut window_builder =
             create_window_builder(window_name, config, tab_id, app_id, quake);
+
+        // A torn-off tab keeps its window's size and opens under the
+        // cursor, instead of the configured grid size or centering.
+        let (detached_grid, sized_by_tab) = match detached_tab {
+            Some(tab) => {
+                window_builder = window_builder
+                    .with_inner_size(tab.size)
+                    .with_position(tab.position);
+                (Some(tab.grid), true)
+            }
+            None => (None, false),
+        };
 
         // The quake window starts hidden; the caller anchors it to the
         // monitor under the cursor and shows it (position changes on
@@ -890,11 +951,19 @@ impl<'a> RouteWindow<'a> {
             window_id: winit_window.id(),
         };
 
-        let mut screen =
-            Screen::new(properties, config, event_proxy, font_library, open_url)
-                .expect("Screen not created");
+        let mut screen = Screen::new(
+            properties,
+            config,
+            event_proxy,
+            font_library,
+            open_url,
+            detached_grid,
+        )
+        .expect("Screen not created");
 
-        if config.window.columns.is_some() || config.window.rows.is_some() {
+        if !sized_by_tab
+            && (config.window.columns.is_some() || config.window.rows.is_some())
+        {
             let (physical_width, physical_height) = compute_window_size_from_grid(
                 config.window.columns,
                 config.window.rows,

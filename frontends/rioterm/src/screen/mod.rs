@@ -24,7 +24,7 @@ use crate::crosswords::{
     Mode,
 };
 use crate::hints::HintState;
-use crate::layout::ContextDimension;
+use crate::layout::{ContextDimension, ContextGrid};
 use crate::mouse::{calculate_mouse_position, Mouse};
 use crate::renderer::island::{self, TabStripLayout, ISLAND_HEIGHT};
 use crate::renderer::{utils::padding_top_from_config, Renderer};
@@ -142,6 +142,7 @@ impl Screen<'_> {
         event_proxy: EventProxy,
         font_library: &rio_backend::sugarloaf::font::FontLibrary,
         open_url: Option<String>,
+        tab: Option<ContextGrid<EventProxy>>,
     ) -> Result<Screen<'screen>, Box<dyn Error>> {
         let size = window_properties.size;
         let scale = window_properties.scale;
@@ -310,6 +311,7 @@ impl Screen<'_> {
             context_dimension,
             scaled_margin,
             sugarloaf_errors,
+            tab.is_some(),
         )?;
 
         sugarloaf.set_window_opaque(window_should_be_opaque(config));
@@ -326,7 +328,7 @@ impl Screen<'_> {
             sugarloaf.clear_background_image();
         }
 
-        Ok(Screen {
+        let mut screen = Screen {
             search_state: SearchState::default(),
             hint_state: HintState::new(config.hints.alphabet.clone()),
             hints_config: config
@@ -355,7 +357,70 @@ impl Screen<'_> {
             last_close_press: None,
             grids: rustc_hash::FxHashMap::default(),
             grid_rasterizer: rio_grid::GridGlyphRasterizer::new(),
-        })
+        };
+        if let Some(tab) = tab {
+            screen.adopt_tab(tab);
+        }
+        Ok(screen)
+    }
+
+    /// Make a tab torn off another window this window's only tab,
+    /// refitted to this window's margins, scale and size.
+    fn adopt_tab(&mut self, tab: ContextGrid<EventProxy>) {
+        let placeholder = self.context_manager.current_grid();
+        let scaled_margin = placeholder.scaled_margin;
+        let (width, height) = (placeholder.width, placeholder.height);
+        let scale = self.sugarloaf.scale_factor();
+
+        self.context_manager.adopt_tab(tab, &mut self.sugarloaf);
+
+        let grid = self.context_manager.current_grid_mut();
+        grid.update_scaled_margin(scaled_margin);
+        grid.update_scale(scale);
+        for item in grid.contexts_mut().values_mut() {
+            item.context_mut().dimension.update_scale(scale);
+        }
+        grid.update_dimensions(&mut self.sugarloaf);
+        grid.resize(width, height, &mut self.sugarloaf);
+        self.refresh_titles();
+        self.mark_dirty();
+    }
+
+    /// Detach the focused tab so a new window can adopt it. `None`
+    /// when it is the window's only tab.
+    pub fn detach_current_tab(
+        &mut self,
+        clipboard: &mut Clipboard,
+    ) -> Option<ContextGrid<EventProxy>> {
+        if self.ctx().len() < 2 {
+            return None;
+        }
+
+        self.stop_hint_mode_if_active();
+        self.cancel_search(clipboard);
+        self.clear_selection();
+        if let Some(ref mut island) = self.renderer.island {
+            island.cancel_drag();
+            island.dismiss_color_picker();
+        }
+
+        let tab = self.context_manager.take_current_tab(&mut self.sugarloaf)?;
+        // GPU cell buffers belong to this window's renderer; the new
+        // window builds its own on first render.
+        for item in tab.contexts().values() {
+            self.grids.remove(&item.val.route_id);
+        }
+
+        let num_tabs = self.ctx().len();
+        self.resize_top_or_bottom_line(num_tabs);
+        #[cfg(not(target_os = "macos"))]
+        if num_tabs <= 1 {
+            self.context_manager
+                .current_grid_mut()
+                .update_dimensions(&mut self.sugarloaf);
+        }
+        self.mark_dirty();
+        Some(tab)
     }
 
     #[inline]
@@ -3095,6 +3160,7 @@ impl Screen<'_> {
                     clicked_tab,
                     mouse_x_unscaled - tab_left,
                     mouse_x_unscaled,
+                    mouse_y as f32 / scale_factor,
                 );
             }
         }
@@ -3102,7 +3168,9 @@ impl Screen<'_> {
         true
     }
 
-    pub fn handle_tab_drag_move(&mut self, x_unscaled: f32) {
+    /// `x_unscaled`/`y_unscaled` are window-relative and unclamped: the
+    /// pointer leaving the window is what tears the tab off.
+    pub fn handle_tab_drag_move(&mut self, x_unscaled: f32, y_unscaled: f32) {
         let num_tabs = self.context_manager.len();
 
         // A tab closed mid-drag invalidates the armed indices.
@@ -3117,8 +3185,16 @@ impl Screen<'_> {
 
         let (drag_idx, center) = match self.renderer.island.as_mut() {
             Some(island) => {
-                if !island.update_drag(x_unscaled) {
+                let window_width =
+                    self.sugarloaf.window_size().width / self.sugarloaf.scale_factor();
+                if !island.update_drag(x_unscaled, y_unscaled, window_width) {
                     // armed but still below the drag threshold
+                    return;
+                }
+                // A torn-off tab holds its slot until it is released
+                // into a new window or dragged back into the strip.
+                if island.is_torn_off() {
+                    self.mark_dirty();
                     return;
                 }
                 match (island.drag_index(), island.drag_center(&layout)) {

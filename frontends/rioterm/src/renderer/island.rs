@@ -39,6 +39,9 @@ const BELL_GAP: f32 = 4.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const DRAG_ANIMATION_LENGTH: f32 = 0.15;
 const DRAG_MAX_DT: f32 = 0.05;
+/// How far (unscaled) the pointer must leave the tab strip, or the
+/// window's sides, before a dragged tab tears off into its own window.
+const TEAR_OFF_DISTANCE: f32 = 32.0;
 const ISLAND_MARGIN_RIGHT: f32 = 8.0;
 
 /// Color picker constants
@@ -88,14 +91,20 @@ const INACTIVE_CUSTOM_MUTE: f32 = 0.55;
 struct TabDrag {
     // Index of the dragged tab, follows the tab as it reorders.
     tab_index: usize,
-    // Mouse x at press (unscaled), for the drag threshold.
+    // Mouse position at press (unscaled), for the drag threshold.
     press_x: f32,
+    press_y: f32,
     // press_x − tab_left_x, keeps the grab point under the cursor.
     grab_offset: f32,
-    // Latest unscaled mouse x.
+    // Latest unscaled mouse position, unclamped (it can sit outside
+    // the window).
     current_x: f32,
+    current_y: f32,
     // True once movement exceeded `DRAG_THRESHOLD`.
     started: bool,
+    // True while the pointer is far enough outside the strip that a
+    // release detaches the tab into a new window.
+    torn_off: bool,
 }
 
 fn fit_title_to_width<'a>(
@@ -467,29 +476,60 @@ impl Island {
 
     /// Arm a tab drag at mouse press. The drag only `started`s once the
     /// pointer moves past `DRAG_THRESHOLD`.
-    pub fn start_drag(&mut self, tab_index: usize, grab_offset: f32, x: f32) {
+    pub fn start_drag(&mut self, tab_index: usize, grab_offset: f32, x: f32, y: f32) {
         self.drag = Some(TabDrag {
             tab_index,
             press_x: x,
+            press_y: y,
             grab_offset,
             current_x: x,
+            current_y: y,
             started: false,
+            torn_off: false,
         });
     }
 
-    /// Feed a mouse move into the armed drag. Returns `true` once the
-    /// drag is active (threshold exceeded).
-    pub fn update_drag(&mut self, x: f32) -> bool {
+    /// Feed an unclamped mouse move (unscaled, window-relative) into the
+    /// armed drag. `window_width` is unscaled and bounds the tear-off
+    /// zone horizontally. Returns `true` once the drag is active
+    /// (threshold exceeded).
+    pub fn update_drag(&mut self, x: f32, y: f32, window_width: f32) -> bool {
         match self.drag.as_mut() {
             Some(drag) => {
                 drag.current_x = x;
-                if !drag.started && (x - drag.press_x).abs() > DRAG_THRESHOLD {
+                drag.current_y = y;
+                if !drag.started
+                    && ((x - drag.press_x).abs() > DRAG_THRESHOLD
+                        || (y - drag.press_y).abs() > DRAG_THRESHOLD)
+                {
                     drag.started = true;
                 }
+                drag.torn_off = drag.started
+                    && (!(-TEAR_OFF_DISTANCE..=ISLAND_HEIGHT + TEAR_OFF_DISTANCE)
+                        .contains(&y)
+                        || !(-TEAR_OFF_DISTANCE..=window_width + TEAR_OFF_DISTANCE)
+                            .contains(&x));
                 drag.started
             }
             None => false,
         }
+    }
+
+    /// Whether releasing the active drag now detaches the tab.
+    pub fn is_torn_off(&self) -> bool {
+        self.drag.as_ref().is_some_and(|d| d.torn_off)
+    }
+
+    /// Unscaled distance from the dragged tab's left edge to the grab
+    /// point, so a detached window can open with the tab under the
+    /// cursor.
+    pub fn drag_grab_offset(&self) -> Option<f32> {
+        self.drag.as_ref().map(|d| d.grab_offset)
+    }
+
+    /// Latest unscaled, window-relative pointer position of the drag.
+    pub fn drag_pointer(&self) -> Option<(f32, f32)> {
+        self.drag.as_ref().map(|d| (d.current_x, d.current_y))
     }
 
     /// Whether a drag is armed or active.
@@ -1904,14 +1944,41 @@ mod tests {
     #[test]
     fn drag_threshold_gates_start() {
         let mut island = test_island();
-        island.start_drag(0, 10.0, 50.0);
+        island.start_drag(0, 10.0, 50.0, 10.0);
         assert!(island.is_dragging());
         assert_eq!(island.drag_index(), None, "not started below threshold");
-        assert!(!island.update_drag(52.0));
-        assert!(island.update_drag(58.0), "8px exceeds threshold");
+        assert!(!island.update_drag(52.0, 10.0, 2000.0));
+        assert!(
+            island.update_drag(58.0, 10.0, 2000.0),
+            "8px exceeds threshold"
+        );
         assert_eq!(island.drag_index(), Some(0));
         island.cancel_drag();
         assert!(!island.is_dragging());
+    }
+
+    #[test]
+    fn drag_tears_off_outside_the_strip() {
+        let mut island = test_island();
+        island.start_drag(1, 10.0, 150.0, 10.0);
+        // A vertical-only move also starts the drag.
+        assert!(island.update_drag(150.0, 20.0, 800.0));
+        assert!(!island.is_torn_off(), "still inside the strip");
+
+        island.update_drag(150.0, ISLAND_HEIGHT + TEAR_OFF_DISTANCE + 1.0, 800.0);
+        assert!(island.is_torn_off(), "dragged below the strip");
+
+        island.update_drag(150.0, 10.0, 800.0);
+        assert!(!island.is_torn_off(), "back in the strip reattaches");
+
+        island.update_drag(-TEAR_OFF_DISTANCE - 1.0, 10.0, 800.0);
+        assert!(island.is_torn_off(), "dragged past the left edge");
+        island.update_drag(800.0 + TEAR_OFF_DISTANCE + 1.0, 10.0, 800.0);
+        assert!(island.is_torn_off(), "dragged past the right edge");
+        assert_eq!(island.drag_grab_offset(), Some(10.0));
+
+        island.cancel_drag();
+        assert!(!island.is_torn_off());
     }
 
     fn test_layout() -> TabStripLayout {
@@ -1970,25 +2037,25 @@ mod tests {
         let mut island = test_island();
         // Tab 0 grabbed 10px from its left edge, tabs region spans
         // 0..400 with 100-wide slots.
-        island.start_drag(0, 10.0, 50.0);
-        island.update_drag(200.0); // started
+        island.start_drag(0, 10.0, 50.0, 10.0);
+        island.update_drag(200.0, 10.0, 2000.0); // started
         let center = island.drag_center(&test_layout()).unwrap();
         assert_eq!(center, 190.0 + 50.0);
 
         // Dragged far right: floating left clamps to 300, center 350.
-        island.update_drag(1000.0);
+        island.update_drag(1000.0, 10.0, 2000.0);
         assert_eq!(island.drag_center(&test_layout()), Some(350.0));
 
         // Far left: clamps to 0, center 50.
-        island.update_drag(-500.0);
+        island.update_drag(-500.0, 10.0, 2000.0);
         assert_eq!(island.drag_center(&test_layout()), Some(50.0));
     }
 
     #[test]
     fn end_drag_seeds_settle_spring() {
         let mut island = test_island();
-        island.start_drag(2, 0.0, 200.0);
-        island.update_drag(250.0); // floating left = 250, slot x = 200
+        island.start_drag(2, 0.0, 200.0, 10.0);
+        island.update_drag(250.0, 10.0, 2000.0); // floating left = 250, slot x = 200
         island.end_drag(&test_layout());
         assert!(!island.is_dragging());
         let spring = island.slide_springs.get(&2).unwrap();

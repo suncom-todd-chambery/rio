@@ -2,7 +2,7 @@ use super::*;
 use crate::ansi::CursorShape;
 use crate::crosswords::pos::{Column, Line};
 use crate::crosswords::CrosswordsSize;
-use crate::event::VoidListener;
+use crate::event::{VoidListener, WindowId};
 use std::sync::mpsc;
 use std::time::Duration;
 use teletypewriter::{ChildEvent, EventedPty, ProcessReadWrite, WinsizeBuilder};
@@ -136,7 +136,6 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
             raw_error: None,
         },
         VoidListener,
-        WindowId::from(0),
         0,
     )
     .unwrap()
@@ -300,7 +299,7 @@ fn pending_sync_is_visible_before_child_exited_notification() {
     let (registration, readiness) = corcovado::Registration::new2();
     pty.child = Some(registration);
     readiness.set_readiness(Ready::readable()).unwrap();
-    let machine = Machine::new(terminal, pty, observer, WindowId::from(0), 0).unwrap();
+    let machine = Machine::new(terminal, pty, observer, 0).unwrap();
     let worker = machine.spawn();
     assert_eq!(
         receiver.recv_timeout(Duration::from_secs(5)).unwrap(),

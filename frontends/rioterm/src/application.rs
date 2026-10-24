@@ -1,7 +1,7 @@
 use crate::event::{ClickState, EventPayload, EventProxy, RioEvent, RioEventType};
 use crate::ime::{Preedit, PreeditCursor};
 use crate::renderer::utils::update_colors_based_on_theme;
-use crate::router::{routes::RoutePath, Router};
+use crate::router::{routes::RoutePath, DetachedTab, Route, Router};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::screen::touch::on_touch;
 use crate::watcher::configuration_file_updates;
@@ -89,6 +89,42 @@ impl Application<'_> {
             #[cfg(target_os = "macos")]
             quake_previous_app: None,
         }
+    }
+
+    /// Detach the dragged tab when it is released torn off the strip.
+    /// The new window keeps this window's size and opens with the tab
+    /// under the cursor.
+    fn tear_off_tab(
+        route: &mut Route<'_>,
+        clipboard: &mut Clipboard,
+    ) -> Option<DetachedTab> {
+        use crate::renderer::island::ISLAND_HEIGHT;
+
+        let island = route.window.screen.renderer.island.as_ref()?;
+        if !island.is_torn_off() {
+            return None;
+        }
+        let (x, y) = island.drag_pointer()?;
+        let grab_offset = island.drag_grab_offset()?;
+
+        let scale = route.window.screen.sugarloaf.scale_factor();
+        let size = route.window.winit_window.inner_size();
+        let origin = route
+            .window
+            .winit_window
+            .inner_position()
+            .unwrap_or_default();
+        let position = rio_window::dpi::PhysicalPosition::new(
+            origin.x + ((x - grab_offset) * scale) as i32,
+            origin.y + ((y - ISLAND_HEIGHT / 2.0) * scale) as i32,
+        );
+
+        let grid = route.window.screen.detach_current_tab(clipboard)?;
+        Some(DetachedTab {
+            grid,
+            position,
+            size,
+        })
     }
 
     fn skip_window_event(event: &WindowEvent) -> bool {
@@ -1549,6 +1585,20 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                 .as_ref()
                                 .is_some_and(|i| i.is_dragging())
                         {
+                            if let Some(tab) =
+                                Self::tear_off_tab(route, &mut self.router.clipboard)
+                            {
+                                route.window.winit_window.set_cursor(CursorIcon::Default);
+                                route.request_redraw();
+                                self.router.create_window_from_tab(
+                                    event_loop,
+                                    self.event_proxy.clone(),
+                                    &self.config,
+                                    tab,
+                                    self.app_id.as_deref(),
+                                );
+                                return;
+                            }
                             let started = route.window.screen.handle_tab_drag_release();
                             if started {
                                 route.request_redraw();
@@ -1775,9 +1825,24 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         .as_ref()
                         .is_some_and(|i| i.is_dragging())
                 {
+                    // Unclamped: leaving the window tears the tab off.
                     let scale = route.window.screen.sugarloaf.scale_factor();
-                    route.window.screen.handle_tab_drag_move(x as f32 / scale);
-                    route.window.winit_window.set_cursor(CursorIcon::Default);
+                    route.window.screen.handle_tab_drag_move(
+                        position.x as f32 / scale,
+                        position.y as f32 / scale,
+                    );
+                    let torn_off = route
+                        .window
+                        .screen
+                        .renderer
+                        .island
+                        .as_ref()
+                        .is_some_and(|i| i.is_torn_off());
+                    route.window.winit_window.set_cursor(if torn_off {
+                        CursorIcon::Grabbing
+                    } else {
+                        CursorIcon::Default
+                    });
                     route.request_redraw();
                     return;
                 }
