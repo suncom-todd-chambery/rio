@@ -43,6 +43,14 @@ const DRAG_MAX_DT: f32 = 0.05;
 /// window's sides, before a dragged tab tears off into its own window.
 const TEAR_OFF_DISTANCE: f32 = 32.0;
 const ISLAND_MARGIN_RIGHT: f32 = 8.0;
+/// Ghost frame previewing the window a torn-off tab will open. Drawn
+/// below the floating tab (order 11) but above the terminal panels.
+const GHOST_ORDER: u8 = 10;
+const GHOST_BORDER_WIDTH: f32 = 1.5;
+const GHOST_BORDER_ALPHA: f32 = 0.55;
+const GHOST_BODY_ALPHA: f32 = 0.45;
+const GHOST_BAND_ALPHA: f32 = 0.85;
+const GHOST_SHADOW_SPREAD: f32 = 6.0;
 
 /// Color picker constants
 const PICKER_SWATCH_SIZE: f32 = 18.0;
@@ -288,6 +296,19 @@ fn single_title_x(
     (((window_width / scale_factor) - text_width) / 2.0).max(left_margin + TAB_PADDING_X)
 }
 
+/// Whether the tear-off ghost frame `(x, y, w, h)` overlaps the area a
+/// slot's centred title can occupy: the slot less its text padding,
+/// one font size tall. All unscaled.
+#[inline]
+fn ghost_covers_title(ghost: (f32, f32, f32, f32), tab_x: f32, tab_width: f32) -> bool {
+    let (gx, gy, gw, gh) = ghost;
+    let left = tab_x + TAB_PADDING_X;
+    let right = tab_x + tab_width - TAB_PADDING_X;
+    let top = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.0);
+    let bottom = top + TITLE_FONT_SIZE;
+    gx < right && gx + gw > left && gy < bottom && gy + gh > top
+}
+
 #[inline]
 fn close_button_center(island_x: f32, island_w: f32) -> Option<f32> {
     (island_w >= CLOSE_MIN_ISLAND_WIDTH)
@@ -318,7 +339,17 @@ fn draw_close_button(
     hover: bool,
     order: u8,
 ) {
-    let cy = ISLAND_HEIGHT / 2.0;
+    draw_close_button_at(sugarloaf, cx, ISLAND_HEIGHT / 2.0, color, hover, order);
+}
+
+fn draw_close_button_at(
+    sugarloaf: &mut Sugarloaf,
+    cx: f32,
+    cy: f32,
+    color: [f32; 4],
+    hover: bool,
+    order: u8,
+) {
     let r = CLOSE_GLYPH_HALF;
     let alpha = if hover {
         CLOSE_ALPHA_HOVER
@@ -530,6 +561,18 @@ impl Island {
     /// Latest unscaled, window-relative pointer position of the drag.
     pub fn drag_pointer(&self) -> Option<(f32, f32)> {
         self.drag.as_ref().map(|d| (d.current_x, d.current_y))
+    }
+
+    /// Top-left (unscaled, window-relative) of the ghost frame a torn-off
+    /// drag previews — where `tear_off_tab` opens the new window, so the
+    /// tab sits under the cursor at its grab point.
+    fn tear_off_ghost_origin(&self) -> Option<(f32, f32)> {
+        self.drag.as_ref().filter(|d| d.torn_off).map(|d| {
+            (
+                d.current_x - d.grab_offset,
+                d.current_y - ISLAND_HEIGHT / 2.0,
+            )
+        })
     }
 
     /// Whether a drag is armed or active.
@@ -787,7 +830,7 @@ impl Island {
         context_manager: &ContextManager<EventProxy>,
         bg_color: [f32; 4],
     ) {
-        let (window_width, _window_height, scale_factor) = dimensions;
+        let (window_width, window_height, scale_factor) = dimensions;
         let num_tabs = context_manager.len();
         let current_tab_index = context_manager.current_index();
 
@@ -848,8 +891,28 @@ impl Island {
 
         // Active drag: the dragged tab is skipped in the slot loop and
         // drawn floating (after the loop, on a higher layer) instead.
+        // A torn-off tab leaves the strip entirely: its slot stays empty
+        // and it is drawn inside a ghost of the window it will open.
         let drag_index = self.drag_index();
-        let floating_left = self.drag_floating_left(&layout);
+        let torn_off = self.is_torn_off();
+        let floating_left = if torn_off {
+            None
+        } else {
+            self.drag_floating_left(&layout)
+        };
+        // Window-sized rect the ghost frame covers, unscaled.
+        let ghost_rect = if torn_off {
+            self.tear_off_ghost_origin().map(|(gx, gy)| {
+                (
+                    gx,
+                    gy,
+                    window_width / scale_factor,
+                    window_height / scale_factor,
+                )
+            })
+        } else {
+            None
+        };
 
         // Adaptive island fills, derived from the effective window bg
         // each frame so OSC 11 and theme changes stay coherent. The
@@ -928,10 +991,13 @@ impl Island {
             // titles passing underneath it — skip a title once the
             // floating tab intrudes past the slot's text padding (the
             // widest a centered title can reach).
+            // Same reason for the tear-off ghost frame: a title it
+            // covers would paint on top of it.
             let hidden_by_drag = floating_left.is_some_and(|fl| {
                 let overlap = (tab_x + tab_width).min(fl + tab_width) - tab_x.max(fl);
                 overlap > TAB_PADDING_X
-            });
+            }) || ghost_rect
+                .is_some_and(|ghost| ghost_covers_title(ghost, tab_x, tab_width));
 
             if !hidden_by_drag {
                 // Measure → centre → draw. Immediate mode, no cached
@@ -1044,65 +1110,29 @@ impl Island {
 
         // Draw the floating (dragged) tab above the slot tabs.
         if let (Some(drag_idx), Some(floating_x)) = (drag_index, floating_left) {
-            let (ix, iy, iw, ih, radius) = island_rect(floating_x, tab_width);
-
-            // Soft elevation: a slightly inflated dark halo behind the
-            // lifted island so it reads as floating over the strip.
-            sugarloaf.rounded_rect(
-                None,
-                ix - 2.0,
-                iy - 1.0,
-                iw + 4.0,
-                ih + 3.0,
-                [0.0, 0.0, 0.0, 0.18],
-                0.05,
-                radius + 2.0,
-                11,
-            );
-
-            let fill = match context_manager.custom_color(drag_idx) {
-                Some(mut custom) => {
-                    custom[3] = 1.0;
-                    custom
-                }
-                None => {
-                    let mut base = bg_color;
-                    base[3] = 1.0;
-                    over(base, fills.active)
-                }
-            };
-            draw_island(
+            self.draw_floating_tab(
                 sugarloaf,
-                ix,
-                iy,
-                iw,
-                ih,
-                radius,
-                fill,
-                fills.outline,
-                None,
-                11,
+                context_manager,
+                drag_idx,
+                floating_x,
+                0.0,
+                tab_width,
+                &fills,
+                bg_color,
             );
+        }
 
-            if let Some(cx) = close_button_center(ix, iw) {
-                draw_close_button(sugarloaf, cx, self.active_text_color, false, 12);
-            }
-
-            let raw_title = self.get_title_for_tab(context_manager, drag_idx);
-            if !raw_title.is_empty() {
-                let max_text_width = (tab_width - TAB_PADDING_X * 2.0).max(0.0);
-                let title = fit_title_to_width(sugarloaf, &raw_title, max_text_width);
-                let title_opts = DrawOpts {
-                    font_size: TITLE_FONT_SIZE,
-                    color: color_u8(self.active_text_color),
-                    ..DrawOpts::default()
-                };
-                let ui = sugarloaf.text_mut();
-                let text_width = ui.measure(&title, &title_opts);
-                let text_x = floating_x + (tab_width - text_width) / 2.0;
-                let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
-                ui.draw(text_x, text_y, &title, &title_opts);
-            }
+        // Torn off: preview the window the release will open.
+        if let (true, Some(drag_idx)) = (torn_off, drag_index) {
+            self.draw_tear_off_ghost(
+                sugarloaf,
+                context_manager,
+                drag_idx,
+                (window_width / scale_factor, window_height / scale_factor),
+                tab_width,
+                &fills,
+                bg_color,
+            );
         }
 
         // Render color picker if open
@@ -1116,6 +1146,167 @@ impl Island {
 
         // Render the progress bar below the island
         self.render_progress_bar(sugarloaf, window_width, scale_factor, ISLAND_HEIGHT);
+    }
+
+    /// Draw the dragged tab lifted above the strip, its slot's left edge
+    /// at `slot_x` and shifted down by `y_offset` (unscaled).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_floating_tab(
+        &self,
+        sugarloaf: &mut Sugarloaf,
+        context_manager: &ContextManager<EventProxy>,
+        drag_idx: usize,
+        slot_x: f32,
+        y_offset: f32,
+        tab_width: f32,
+        fills: &IslandFills,
+        bg_color: [f32; 4],
+    ) {
+        let (ix, iy, iw, ih, radius) = island_rect(slot_x, tab_width);
+        let iy = iy + y_offset;
+
+        // Soft elevation: a slightly inflated dark halo behind the
+        // lifted island so it reads as floating over the strip.
+        sugarloaf.rounded_rect(
+            None,
+            ix - 2.0,
+            iy - 1.0,
+            iw + 4.0,
+            ih + 3.0,
+            [0.0, 0.0, 0.0, 0.18],
+            0.05,
+            radius + 2.0,
+            11,
+        );
+
+        let fill = match context_manager.custom_color(drag_idx) {
+            Some(mut custom) => {
+                custom[3] = 1.0;
+                custom
+            }
+            None => {
+                let mut base = bg_color;
+                base[3] = 1.0;
+                over(base, fills.active)
+            }
+        };
+        draw_island(
+            sugarloaf,
+            ix,
+            iy,
+            iw,
+            ih,
+            radius,
+            fill,
+            fills.outline,
+            None,
+            11,
+        );
+
+        if let Some(cx) = close_button_center(ix, iw) {
+            draw_close_button_at(
+                sugarloaf,
+                cx,
+                ISLAND_HEIGHT / 2.0 + y_offset,
+                self.active_text_color,
+                false,
+                12,
+            );
+        }
+
+        let raw_title = self.get_title_for_tab(context_manager, drag_idx);
+        if !raw_title.is_empty() {
+            let max_text_width = (tab_width - TAB_PADDING_X * 2.0).max(0.0);
+            let title = fit_title_to_width(sugarloaf, &raw_title, max_text_width);
+            let title_opts = DrawOpts {
+                font_size: TITLE_FONT_SIZE,
+                color: color_u8(self.active_text_color),
+                ..DrawOpts::default()
+            };
+            let ui = sugarloaf.text_mut();
+            let text_width = ui.measure(&title, &title_opts);
+            let text_x = slot_x + (tab_width - text_width) / 2.0;
+            let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.) + y_offset;
+            ui.draw(text_x, text_y, &title, &title_opts);
+        }
+    }
+
+    /// Ghost frame of the window a torn-off tab opens on release: the
+    /// window's size, placed where `tear_off_tab` will put it (tab under
+    /// the cursor at its grab point), with the tab in its strip. The
+    /// part beyond this window is clipped, which is fine — the frame
+    /// only has to signal that a new window is about to appear.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_tear_off_ghost(
+        &self,
+        sugarloaf: &mut Sugarloaf,
+        context_manager: &ContextManager<EventProxy>,
+        drag_idx: usize,
+        (width, height): (f32, f32),
+        tab_width: f32,
+        fills: &IslandFills,
+        bg_color: [f32; 4],
+    ) {
+        let Some((x, y)) = self.tear_off_ghost_origin() else {
+            return;
+        };
+
+        let mut text = self.active_text_color;
+        text[3] = 1.0;
+        let border = [text[0], text[1], text[2], GHOST_BORDER_ALPHA];
+
+        // Drop shadow, then a translucent body so the terminal below
+        // stays visible, then a more opaque title band for the strip.
+        sugarloaf.rounded_rect(
+            None,
+            x - GHOST_SHADOW_SPREAD,
+            y - GHOST_SHADOW_SPREAD + 2.0,
+            width + GHOST_SHADOW_SPREAD * 2.0,
+            height + GHOST_SHADOW_SPREAD * 2.0,
+            [0.0, 0.0, 0.0, 0.22],
+            0.05,
+            GHOST_SHADOW_SPREAD * 2.0,
+            GHOST_ORDER,
+        );
+        let mut body = bg_color;
+        body[3] = GHOST_BODY_ALPHA;
+        sugarloaf.rect(None, x, y, width, height, body, 0.05, GHOST_ORDER);
+        let mut band = bg_color;
+        band[3] = GHOST_BAND_ALPHA;
+        sugarloaf.rect(None, x, y, width, ISLAND_HEIGHT, band, 0.05, GHOST_ORDER);
+        // Strip divider.
+        sugarloaf.rect(
+            None,
+            x,
+            y + ISLAND_HEIGHT,
+            width,
+            1.0,
+            [text[0], text[1], text[2], GHOST_BORDER_ALPHA * 0.5],
+            0.05,
+            GHOST_ORDER,
+        );
+
+        // Frame outline, one edge per rect.
+        let b = GHOST_BORDER_WIDTH;
+        for (rx, ry, rw, rh) in [
+            (x, y, width, b),
+            (x, y + height - b, width, b),
+            (x, y, b, height),
+            (x + width - b, y, b, height),
+        ] {
+            sugarloaf.rect(None, rx, ry, rw, rh, border, 0.05, GHOST_ORDER);
+        }
+
+        self.draw_floating_tab(
+            sugarloaf,
+            context_manager,
+            drag_idx,
+            x,
+            y,
+            tab_width,
+            fills,
+            bg_color,
+        );
     }
 
     /// Toggle the color picker for a given tab index
@@ -1979,6 +2170,50 @@ mod tests {
 
         island.cancel_drag();
         assert!(!island.is_torn_off());
+    }
+
+    #[test]
+    fn ghost_hides_only_titles_it_covers() {
+        // Slot 100..300: title box 127..273 horizontally.
+        let (tab_x, tab_width) = (100.0, 200.0);
+        // Dragged up so the frame's body spans the strip over the slot.
+        assert!(ghost_covers_title(
+            (150.0, -400.0, 800.0, 600.0),
+            tab_x,
+            tab_width
+        ));
+        // Dragged below the strip: frame starts under the titles.
+        assert!(!ghost_covers_title(
+            (0.0, ISLAND_HEIGHT + 40.0, 800.0, 600.0),
+            tab_x,
+            tab_width
+        ));
+        // Off to the left, ending inside the slot's text padding.
+        assert!(!ghost_covers_title(
+            (-700.0, -10.0, 820.0, 600.0),
+            tab_x,
+            tab_width
+        ));
+        // Same, but reaching into the title area.
+        assert!(ghost_covers_title(
+            (-700.0, -10.0, 840.0, 600.0),
+            tab_x,
+            tab_width
+        ));
+    }
+
+    #[test]
+    fn ghost_origin_tracks_torn_off_drag() {
+        let mut island = test_island();
+        island.start_drag(1, 10.0, 150.0, 10.0);
+        island.update_drag(150.0, 20.0, 800.0);
+        assert_eq!(island.tear_off_ghost_origin(), None, "not torn off");
+        let y = ISLAND_HEIGHT + TEAR_OFF_DISTANCE + 1.0;
+        island.update_drag(300.0, y, 800.0);
+        assert_eq!(
+            island.tear_off_ghost_origin(),
+            Some((290.0, y - ISLAND_HEIGHT / 2.0))
+        );
     }
 
     fn test_layout() -> TabStripLayout {
